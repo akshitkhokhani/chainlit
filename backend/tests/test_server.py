@@ -1328,3 +1328,92 @@ def test_oauth_azure_hf_callback_none_user_redirects(
     )
     assert response.status_code == 303
     assert "error=oauthSignin" in response.headers["location"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["disabled", "wrong_mime", "oversize", "missing_parent", "allowed", "ask_override"],
+)
+def test_rejected_multipart_is_not_read(
+    case,
+    monkeypatch,
+    tmp_path,
+    test_config,
+    mock_session_get_by_id_patched,
+    test_client,
+):
+    from starlette.datastructures import UploadFile
+
+    settings = SpontaneousFileUploadFeature(
+        enabled=True, accept=["text/plain"], max_size_mb=1
+    )
+    if case in ["disabled", "ask_override"]:
+        settings.enabled = False
+    if case == "wrong_mime":
+        settings.accept = ["image/png"]
+    if case == "oversize":
+        settings.max_size_mb = 0
+    test_config.features.spontaneous_file_upload = settings
+    files_spec = {}
+    if case == "ask_override":
+        files_spec["parent"] = AskFileSpec(
+            type="file",
+            timeout=30,
+            step_id="parent",
+            max_files=1,
+            accept=["text/plain"],
+            max_size_mb=1,
+        )
+    session = mock_session_get_by_id_patched
+    session.files_dir = tmp_path / "files"
+    session.files_spec = files_spec
+    session.persist_file = AsyncMock(return_value={"id": "synthetic"})
+    monkeypatch.setitem(app.dependency_overrides, get_current_user, lambda: None)
+    uploads, reads = [], []
+    original_init, original_read = UploadFile.__init__, UploadFile.read
+
+    def capture_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        uploads.append(self)
+
+    async def capture_read(self, *args, **kwargs):
+        reads.append((self.size, self.filename))
+        return await original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(UploadFile, "__init__", capture_init)
+    monkeypatch.setattr(UploadFile, "read", capture_read)
+    params = {"session_id": session.id}
+    if case in ["missing_parent", "ask_override"]:
+        params["ask_parent_id"] = "parent"
+    response = test_client.post(
+        "/project/file",
+        params=params,
+        files={"file": ("sample.txt", b"x", "text/plain")},
+    )
+    expected = (
+        404
+        if case == "missing_parent"
+        else 200
+        if case in ["allowed", "ask_override"]
+        else 400
+    )
+    assert response.status_code == expected, response.text
+    details = {
+        "disabled": "File upload is not enabled",
+        "wrong_mime": "File type not allowed",
+        "oversize": "File size too large",
+        "missing_parent": "Parent message not found",
+    }
+    if case in details:
+        assert response.json()["detail"] == details[case]
+    assert len(uploads) == 1
+    assert uploads[0].size == 1
+    assert uploads[0].file.closed
+    if expected == 200:
+        assert reads == [(1, "sample.txt")]
+        session.persist_file.assert_awaited_once_with(
+            name="sample.txt", content=b"x", mime="text/plain"
+        )
+    else:
+        session.persist_file.assert_not_awaited()
+        assert reads == []
